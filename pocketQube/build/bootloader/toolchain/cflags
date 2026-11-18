@@ -1,5 +1,0 @@
-"-specs=/home/hussein/Code/Vs_Code/CANSAT/catsat-embedded/mobile/build/bootloader/specs/picolibc.specs"
--mlongcalls
--fno-builtin-memcpy
--fno-builtin-memset
--fno-builtin-bzero

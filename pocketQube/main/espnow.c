@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -267,46 +268,24 @@ esp_err_t espnow_send_telemetry(const telemetry_data_t *telemetry, uint32_t sequ
     if (telemetry == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-
     if (!peer_known) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    // Populate metadata
-    telemetry->team_id = 123;
-    telemetry->author = 1;
-    telemetry->mode = 0;
-    telemetry->type = ESPNOW_MESSAGE_TELEMETRY;
-    telemetry->packet_token = sequence;
-
-    // Populate dummy sensor values
-    telemetry->battery_voltage = 7.4f;
-
-    telemetry->gps_lat = 30.123456;
-    telemetry->gps_long = 76.123456;
-
-    telemetry->imu_ax = 0.1f;
-    telemetry->imu_ay = 0.2f;
-    telemetry->imu_az = 9.81f;
-
-    telemetry->imu_gx = 0.01f;
-    telemetry->imu_gy = 0.02f;
-    telemetry->imu_gz = 0.03f;
 
     espnow_telemetry_packet_t packet = {
         .magic = ESPNOW_PROTOCOL_MAGIC,
         .version = ESPNOW_PROTOCOL_VERSION,
         .type = ESPNOW_MESSAGE_TELEMETRY,
         .sequence = sequence,
+        .telemetry = *telemetry,          // copy caller's sensor data
     };
-
     memcpy(packet.sender_mac, local_mac, ESP_NOW_ETH_ALEN);
 
-    packet.telemetry = *telemetry;
-
-    return esp_now_send(
-        peer_mac,
-        (const uint8_t *)&packet,
-        sizeof(packet)
-    );
+    // Metadata is owned by the radio layer, set on the copy
+    packet.telemetry.team_id = 123;       // TODO: real team number
+    packet.telemetry.author = 1;          // 1 = PocketQube
+    packet.telemetry.type = 0;            // 0 = routine telemetry (team plan)
+    packet.telemetry.packet_token = sequence;
+    
+    return esp_now_send(peer_mac, (const uint8_t *)&packet, sizeof(packet));
 }

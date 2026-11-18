@@ -4,6 +4,7 @@
 
 #include "command_parser.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "espnow.h"
 #include "freertos/FreeRTOS.h"
@@ -16,8 +17,10 @@
 #define LED_GPIO 48 /* ESP32-S3 dev boards with a WS2812 */
 #define TELEMETRY_PERIOD_MS 250
 
+
 static const char *TAG = "P2P_APP";
 static led_strip_handle_t led_strip;
+static command_state_t cmd_state;
 
 static void configure_led(void)
 {
@@ -45,20 +48,31 @@ static void pulse_led(void)
     ESP_ERROR_CHECK(led_strip_clear(led_strip));
 }
 
+
+static void fill_dummy_telemetry(telemetry_data_t *t, const command_state_t *cmd)
+{
+    t->op_mode = cmd->op_mode;
+    t->cmd_count = cmd->count;
+    snprintf(t->cmd_echo, sizeof(t->cmd_echo), "%s", cmd->echo);
+    t->timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    t->battery_voltage = 7.4f;
+    t->gps_lat = 30.123456;
+    t->gps_long = 76.123456;
+    t->imu_ax = 0.1f;  t->imu_ay = 0.2f;  t->imu_az = 9.81f;
+    t->imu_gx = 0.01f; t->imu_gy = 0.02f; t->imu_gz = 0.03f;
+}
 static void process_message(const espnow_message_t *message)
 {
-    if (message->type == ESPNOW_MESSAGE_RESPONSE) {
-        ESP_LOGI(TAG, "Response #%" PRIu32 ": %s", message->sequence, message->text);
-        return;
-    }
     if (message->type != ESPNOW_MESSAGE_COMMAND) {
         return;
     }
 
-    char response[ESPNOW_TEXT_SIZE];
-    command_parse(message->text, response, sizeof(response));
-    ESP_LOGI(TAG, "Command '%s' -> '%s'", message->text, response);
-    esp_err_t err = espnow_send(ESPNOW_MESSAGE_RESPONSE, message->sequence, response);
+    char reply[CMD_REPLY_SIZE];
+    cmd_result_t rc = command_handle(message->text, &cmd_state, reply, sizeof(reply));
+    ESP_LOGI(TAG, "Command '%s' -> '%s' (rc=%d)", message->text, reply, rc);
+
+    esp_err_t err = espnow_send(ESPNOW_MESSAGE_RESPONSE, message->sequence, reply);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Could not queue command response: %s", esp_err_to_name(err));
     }
@@ -67,6 +81,7 @@ static void process_message(const espnow_message_t *message)
 void app_main(void)
 {
     configure_led();
+    command_state_init(&cmd_state);
     ESP_ERROR_CHECK(espnow_init());
 
     uint32_t discovery_sequence = 0;
@@ -79,6 +94,7 @@ void app_main(void)
     TickType_t last_telemetry = 0;
 
     telemetry_data_t telemetry = {0};
+
     while (true) {
         const TickType_t now = xTaskGetTickCount();
 
@@ -95,10 +111,9 @@ void app_main(void)
 
         if (espnow_peer_available() && now - last_telemetry >= pdMS_TO_TICKS(TELEMETRY_PERIOD_MS)) 
         {
-            esp_err_t err = espnow_send_telemetry(
-                &telemetry,
-                telemetry_sequence
-            );
+            fill_dummy_telemetry(&telemetry, &cmd_state);
+            esp_err_t err = espnow_send_telemetry(&telemetry, telemetry_sequence);
+
 
             if (err == ESP_OK) {
                 telemetry_sequence++;
@@ -110,6 +125,11 @@ void app_main(void)
             }
 
             last_telemetry = now;
+        }
+
+        if (cmd_state.pending_actions & ACTION_DEPLOY_BOOM) {
+            // fire boom mechanism here
+            cmd_state.pending_actions &= ~ACTION_DEPLOY_BOOM;
         }
 
         espnow_message_t message;
