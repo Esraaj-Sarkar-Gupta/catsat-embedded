@@ -1,6 +1,6 @@
 # ESP-IDF build directories
 build/
-pocketQube/build
+managed_components/
 
 # ESP-IDF generated configuration
 sdkconfig
@@ -11,6 +11,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+.vscode/
 
 # OS files
 .DS_Store
