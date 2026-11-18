@@ -1,0 +1,17 @@
+{
+    "idf.currentSetup": "/home/hussein/.espressif/v6.1/esp-idf",
+    "idf.port": "/dev/ttyUSB1",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "clangd.path": "/home/hussein/.espressif/tools/esp-clangd/esp-21.1.3_20260408/esp-clangd/bin/clangd",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=/home/hussein/Code/Vs_Code/CANSAT/catsat-embedded/mobile/build"
+    ],
+    "idf.flashType": "UART"
+}
