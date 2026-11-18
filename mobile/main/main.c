@@ -1,96 +1,105 @@
-#include <stdio.h>
-#include <string.h>
+/* Symmetric two-board ESP-NOW demo. Flash the same image to both boards. */
+
 #include <inttypes.h>
+
+#include "command_parser.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "espnow.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_now.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
+#include "led_strip.h"
 
-static const char *TAG = "ESP_NOW_DEMO";
+#define DISCOVERY_PERIOD_MS 5000
+#define COMMAND_PERIOD_MS 2000
+#define LED_PULSE_MS 80
+#define LED_GPIO 48 /* ESP32-S3 dev boards with a WS2812 */
 
-// Broadcast MAC Address (FF:FF:FF:FF:FF:FF)
-static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+static const char *TAG = "P2P_APP";
+static led_strip_handle_t led_strip;
 
-/* ---------------- Callback Functions ---------------- */
-
-// 1. Data Receive Callback
-static void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+static void configure_led(void)
 {
-    const uint8_t *src_mac = recv_info->src_addr;
-    ESP_LOGI(TAG, "Received %d bytes from %02X:%02X:%02X:%02X:%02X:%02X",
-             len, src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
-    
-    ESP_LOGI(TAG, "Payload: %.*s", len, data);
+    const led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_GPIO,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out = false,
+    };
+    const led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    ESP_ERROR_CHECK(led_strip_clear(led_strip));
 }
 
-// 2. Data Sent Confirmation Callback (Updated signature)
-static void OnDataSent(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+static void pulse_led(void)
 {
-    const uint8_t *mac_addr = tx_info->des_addr;
-    ESP_LOGI(TAG, "Transmission to %02X:%02X:%02X:%02X:%02X:%02X Status: %s",
-             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-             status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, 0, 0, 32));
+    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    vTaskDelay(pdMS_TO_TICKS(LED_PULSE_MS));
+    ESP_ERROR_CHECK(led_strip_clear(led_strip));
 }
 
-/* ---------------- Initialization ---------------- */
-
-static void wifi_espnow_init(void)
+static void process_message(const espnow_message_t *message)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
+    if (message->type == ESPNOW_MESSAGE_RESPONSE) {
+        ESP_LOGI(TAG, "Response #%" PRIu32 ": %s", message->sequence, message->text);
+        return;
     }
-    ESP_ERROR_CHECK(ret);
+    if (message->type != ESPNOW_MESSAGE_COMMAND) {
+        return;
+    }
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    uint8_t local_mac[6];
-    // Use WIFI_IF_STA for ESP-IDF v5+ / v6.x
-    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, local_mac));
-    ESP_LOGI(TAG, "Local STA MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-             local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]);
-
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(OnDataRecv));
-    ESP_ERROR_CHECK(esp_now_register_send_cb(OnDataSent));
-
-    esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
-    peer_info.channel = 0;
-    peer_info.encrypt = false;
-
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+    char response[ESPNOW_TEXT_SIZE];
+    command_parse(message->text, response, sizeof(response));
+    ESP_LOGI(TAG, "Command '%s' -> '%s'", message->text, response);
+    esp_err_t err = espnow_send(ESPNOW_MESSAGE_RESPONSE, message->sequence, response);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not queue command response: %s", esp_err_to_name(err));
+    }
 }
 
 void app_main(void)
 {
-    wifi_espnow_init();
+    configure_led();
+    ESP_ERROR_CHECK(espnow_init());
 
-    uint32_t msg_counter = 0;
-    char send_buffer[64];
+    uint32_t discovery_sequence = 0;
+    uint32_t command_sequence = 0;
+    TickType_t last_discovery = 0;
+    TickType_t last_command = 0;
 
-    while (1) {
-        snprintf(send_buffer, sizeof(send_buffer), "Ping Packet #%" PRIu32, msg_counter++);
-        
-        ESP_LOGI(TAG, "Sending: %s", send_buffer);
+    while (true) {
+        const TickType_t now = xTaskGetTickCount();
 
-        esp_err_t result = esp_now_send(broadcast_mac, (uint8_t *)send_buffer, strlen(send_buffer));
-        if (result != ESP_OK) {
-            ESP_LOGE(TAG, "Error sending ESP-NOW packet: %s", esp_err_to_name(result));
+        if (now - last_discovery >= pdMS_TO_TICKS(DISCOVERY_PERIOD_MS)) {
+            esp_err_t err = espnow_send(ESPNOW_MESSAGE_DISCOVERY, discovery_sequence++, "HELLO");
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Sent discovery broadcast");
+                pulse_led();
+            } else {
+                ESP_LOGE(TAG, "Discovery broadcast failed: %s", esp_err_to_name(err));
+            }
+            last_discovery = now;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (espnow_peer_available() &&
+            now - last_command >= pdMS_TO_TICKS(COMMAND_PERIOD_MS)) {
+            const char *command = command_sequence % 2 == 0 ? "PING" : "STATUS?";
+            esp_err_t err = espnow_send(ESPNOW_MESSAGE_COMMAND, command_sequence++, command);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Dummy command failed to queue: %s", esp_err_to_name(err));
+            }
+            last_command = now;
+        }
+
+        espnow_message_t message;
+        if (espnow_receive(&message, pdMS_TO_TICKS(100)) == pdPASS) {
+            process_message(&message);
+        }
     }
 }

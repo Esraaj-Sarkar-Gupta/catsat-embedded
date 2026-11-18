@@ -1,8 +1,9 @@
 ## IDF Component Manager Manifest File
 dependencies:
   ## Required IDF version
+  # This application uses the ESP-IDF v5 ESP-NOW receive/send callback APIs.
   idf:
-    version: '>=4.1.0'
+    version: '>=5.0.0'
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"

@@ -1,272 +1,178 @@
+#include "espnow.h"
+
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
-static const char *ESPNOW_TAG = "ESP_NOW";
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "freertos/queue.h"
+#include "nvs_flash.h"
 
-// Define the broadcast MAC Address (FF:FF:FF:FF:FF:FF)
-// ESP_NOW_ETH_ALEN = 6 -- The standard length of an ethernet/wifi MAC address
-static uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
+#define ESPNOW_RX_QUEUE_LENGTH 8
 
-/*
- * This is the standard MAC address (where every bit is set to 1) for
- * the universal Layer 2 Broadcast Address -- packets are transmitted to
- * every single listening device on the same channel, rather than addressing
- * a single specific node.
- * 
- * We may have to change this in the future since we may be in the proximity
- * of other devices using the same protocol.
- */
+static const char *TAG = "ESPNOW";
+static const uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 typedef struct {
-    uint8_t src_mac[ESP_NOW_ETH_ALEN]; // Store the MAC address
-    uint8_t data[251]; // Store the message data
-    // ESPNOW messages are capped at 250 characters
+    uint8_t source_mac[ESP_NOW_ETH_ALEN];
+    espnow_message_t message;
+} receive_event_t;
 
-    int len; // Store the message length
-} esp_now_event_t;
+static QueueHandle_t receive_queue;
+static uint8_t local_mac[ESP_NOW_ETH_ALEN];
+static uint8_t peer_mac[ESP_NOW_ETH_ALEN];
+static bool peer_known;
 
-/* Define an RTOS Queue */
-static QueueHandle_t espnow_queue;
-
-/* --------- Callback Functions ---------- */
-
-// Data RX Callback
-void OnDataRecv(
-    const esp_now_recv_info *recv_info, // A struct to encapsulate incoming packet data
-    /*
-    typedef struct esp_now_recv_info {
-        uint8_t *src_addr;                      // 6-byte Source MAC address
-        uint8_t *des_addr;                      // 6-byte Destination MAC address
-        wifi_pkt_rx_ctrl_t *rx_ctrl;            // PHY layer metadata (RSSI, channel, rate)
-    } esp_now_recv_info_t;
-    */
-
-   const uint8_t *data, // A read-only pointer to the raw incoming byte array in RAM
-   /*
-    * The buffer address passed into *data is owned by the network driver stack, and is only
-    * valid for the duration of the callback execution. Once "this" function returns the WiFi
-    * stack frees or reclaims this memory.
-    * 
-    * To process incoming data asynchrnously, the bytes in *data are copied to a queue or a
-    * buffer before exiting the function.
-    */
-
-   int len, // The count of the valid data bytes inside data
-) {
-    const uint8_t *src_mac = recv_info->src_addr; // Extract the 6-digit MAC address
-
-    // ESP Logging
-    ESP_LOGI(
-        ESPNOW_TAG,
-        "Recieved %d bytes from %02X:%02X:%02X:%02X:%02X:%02X",
-        len,
-        src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]
-    );
-
-    ESP_LOGI( 
-        ESPNOW_TAG,
-        "Payload: %.*s", // A non-null-terminated string formatting
-        len, data
-    );
-
-    /*
-     * ESP-NOW frame payloads are transmitted over the air are raw-byte arrays, and
-     * do not include the C-style trailing null terminator.
-     */
-
-    /* -- Copy the MAC address and payload -- */
-    /*
-     * An RTOS queue is used since it can be used without blocking
-     * so the WiFi task exits instantly.
-     * 
-     */
-
-    esp_now_event_t evt; // Instantiate the event
- 
-    memcpy(evt.src_mac, recv_info->src_addr, ESP_NOW_ETH_ALEN); // Copy the MAC address into the buffer
-    memcpy(evt.data, data, len); // Copy the data into the queue buffer
-    evt.len = len; // And we need the length too
-
-    // Push to the queue, with error handling
-    if (
-        xQueueSend(
-            espnow_queue, // Queue datastructure
-            &evt,   // Event reference
-            0   // Timeout = 0
-            ) != pdTRUE // If no error we move on
-        ){
-        ESP_LOGI(
-            ESPNOW_TAG,
-            "Queue full, data packet dropped!"
-        );
-    }
-
-    return;
-}
-
-void espnow_process_task(void *pvParameters) // We consider a generic pointer
+static void log_mac(const char *label, const uint8_t mac[ESP_NOW_ETH_ALEN])
 {
-    /*
-     * The task that unpacks the RTOS Queue to process RX
-     *
-     * What the remainder of this function does needs to be programmed. Fill
-     * this space of the docstring with additional functionalities. We are
-     * just Bones and All today.
-     * 
-     */
-    esp_now_event_t evt;
-
-    while(1) {
-        // Wait until a packet arrives in the queue
-        if(
-            xQueueReceive(
-                espnow_queue,
-                &evt,
-                portMAX_DELAY
-            ) == pdTrue
-        ) {
-            // Assuming it's all going well
-
-            char payload_str[251]; // An extra byte for the null-terminator
-            memcpy(payload_str, evt.data, evt.len);
-            payload_str[evt.len] = '\n'; // Throw in that null-terminator
-
-            // Log the success
-            ESP_LOGI(
-                ESPNOW_TAG,
-                "Process a packet from task! Payload: %s",
-                payload_str
-            );
-
-            // The remainder of the logic goes here...
-            // Write up the rest of the functions, won't you?
-
-            // It feels so right to think of the time we could have tonight...
-            // And it's so cold. It seems my hands are colder than yours; warm
-            // me up inside.
-        }
-    }
+    ESP_LOGI(TAG, "%s %02X:%02X:%02X:%02X:%02X:%02X", label,
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-// Data TX Callback
-void OnDataSent(
-    const esp_now_send_info_t *tx_info, // A read-only metadata structure
-    /*
-        typedef struct esp_now_send_info {
-            uint8_t *des_addr;     // 6-byte Destination MAC address
-        } esp_now_send_info_t;
-    */
-   esp_now_send_status_t status // Struct to store the status of TX
-   /*
-        typedef enum {
-            ESP_NOW_SEND_SUCCESS = 0,   // Transmission successful
-            ESP_NOW_SEND_FAIL    = 1,   // Transmission failed
-        } esp_now_send_status_t;
-
-        // We get a "success" if we get an ACK back from the other device.
-   */
-) {
-    const uint8_t *mac_addr = tx_info->des_addr;
-    ESP_LOGI(
-        ESPNOW_TAG,
-        "Transmission to %02X:%02X:%02X:%02X:%02X:%02X Status: %s",
-        mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-        status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail"
-    );ESP_NOW_SEND_FAIL == 1
-
-    // TX failure handling
-    if (status == ESP_NOW_SEND_FAIL) {
-        
-        // It's never over
-        // All my blood for the sweetness of her laughter...
-    }
-
-    return;
-}
-
-/* ---------- Init Functions ---------- */
-esp_err_t espnow_init(void) {
-    /*
-     * 1. Enable NVS -- Non-volatile storage.
-     * 
-     * The NVS stores small data items as key-value pairs in a deddicated
-     * parition of the ESP32's flash memory. This data is retained across
-     * reboots and power losses.
-     * 
-     * The WiFi PHY relies on the NVS to read hardware calibration parameters.
-     * 
-     */
-
-        esp_err_t ret = nvs_flash_init();
-
-        if (
-            ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-            RET == ESP_ERR_NVS_NEW_VERSION_FOUND // This one really shouldn't happen in our framework
-        ) {
-            ESP_ERROR_CHECK(nvs_flash_erase());
-            ret = nsv_flash_init(); 
-        }
-
-        ESP_ERROR_CHECK(ret);
-
-        // 2. Initialize Netif & System Event Loop
-        /*
-         * NETIF is the Network Interface Abstraction Layer
-         *
-         * This prepares the base netywork memory structures, and then
-         * we create the system-wide event dispatch loop.
-         */
-        ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-        // 3. Configure and start Wi-Fi radio in Station (STA) mode
-        /*
-         * Allocate RAM for the WiFi task, and power the 2.4GHz Phy radio.
-         * 
-         * We force the WiFi config to be saved in RAM.
-         * 
-         */
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-        ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM)); // Keep runtime configs in RAM to protect flash
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_start());
-
-        // Print local device MAC address for reference
-        uint8_t local_mac[6];
-        ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, local_mac));
-        ESP_LOGI(ESPNOW_TAG, "Device STA MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
-                local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]);
-
-        // 4. Allocate FreeRTOS Queue for asynchronous packet offloading
-        espnow_queue = xQueueCreate(10, sizeof(esp_now_event_t)); // A thread-safe FIFO memory buffer
-        
-        // Memory allocated for it?
-        if (espnow_queue == NULL) {
-            ESP_LOGE(ESPNOW_TAG, "Failed to allocate memory for FreeRTOS Queue!");
-            return ESP_ERR_NO_MEM;
-        }
-
-        // 5. Spawn background processing task (4096 bytes stack, Priority 5)
-        BaseType_t task_ret = xTaskCreate(espnow_process_task, "espnow_process_task", 4096, NULL, 5, NULL);
-        if (task_ret != pdPASS) {
-            ESP_LOGE(ESPNOW_TAG, "Failed to create processing task!");
-            return ESP_FAIL;
-        }
-
-        // 6. Initialize ESP-NOW protocol engine & attach callbacks
-        ESP_ERROR_CHECK(esp_now_init());
-        ESP_ERROR_CHECK(esp_now_register_recv_cb(OnDataRecv));
-        ESP_ERROR_CHECK(esp_now_register_send_cb(OnDataSent));
-
-        // 7. Register Broadcast Peer in peer table
-        esp_now_peer_info_t peer_info = {};
-        memcpy(peer_info.peer_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
-        peer_info.channel = 0;     // Match current channel (Channel 1)
-        peer_info.encrypt = false; // Set true if using shared keys
-
-        ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-
-        ESP_LOGI(ESPNOW_TAG, "ESP-NOW Subsystem successfully initialized!");
+static esp_err_t add_peer(const uint8_t mac[ESP_NOW_ETH_ALEN])
+{
+    if (esp_now_is_peer_exist(mac)) {
         return ESP_OK;
+    }
+
+    esp_now_peer_info_t peer = {0};
+    memcpy(peer.peer_addr, mac, ESP_NOW_ETH_ALEN);
+    peer.ifidx = WIFI_IF_STA;
+    peer.channel = ESPNOW_CHANNEL;
+    peer.encrypt = false;
+    return esp_now_add_peer(&peer);
+}
+
+/* Wi-Fi callbacks copy data into a queue and return without parsing it. */
+static void on_data_received(const esp_now_recv_info_t *info, const uint8_t *data, int data_len)
+{
+    if (info == NULL || info->src_addr == NULL ||
+        data == NULL || data_len != (int)sizeof(espnow_message_t)) {
+        return;
+    }
+
+    receive_event_t event = {0};
+    memcpy(event.source_mac, info->src_addr, ESP_NOW_ETH_ALEN);
+    memcpy(&event.message, data, sizeof(event.message));
+    event.message.text[ESPNOW_TEXT_SIZE - 1] = '\0';
+    if (xQueueSend(receive_queue, &event, 0) != pdPASS) {
+        ESP_EARLY_LOGW(TAG, "Receive queue full; packet dropped");
+    }
+}
+
+static void on_data_sent(const esp_now_send_info_t *info, esp_now_send_status_t status)
+{
+    ESP_LOGI(TAG, "TX %02X:%02X:%02X:%02X:%02X:%02X: %s",
+             info->des_addr[0], info->des_addr[1], info->des_addr[2],
+             info->des_addr[3], info->des_addr[4], info->des_addr[5],
+             status == ESP_NOW_SEND_SUCCESS ? "delivered" : "not acknowledged");
+}
+
+esp_err_t espnow_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, local_mac));
+    log_mac("Local STA MAC", local_mac);
+
+    receive_queue = xQueueCreate(ESPNOW_RX_QUEUE_LENGTH, sizeof(receive_event_t));
+    if (receive_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(add_peer(broadcast_mac));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(on_data_received));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(on_data_sent));
+    return ESP_OK;
+}
+
+esp_err_t espnow_send(espnow_message_type_t type, uint32_t sequence, const char *text)
+{
+    if (text == NULL ||
+        (type != ESPNOW_MESSAGE_DISCOVERY &&
+         type != ESPNOW_MESSAGE_COMMAND &&
+         type != ESPNOW_MESSAGE_RESPONSE)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const uint8_t *destination = broadcast_mac;
+    if (type != ESPNOW_MESSAGE_DISCOVERY) {
+        if (!peer_known) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        destination = peer_mac;
+    }
+
+    espnow_message_t message = {
+        .magic = ESPNOW_PROTOCOL_MAGIC,
+        .version = ESPNOW_PROTOCOL_VERSION,
+        .type = (uint8_t)type,
+        .sequence = sequence,
+    };
+    memcpy(message.sender_mac, local_mac, ESP_NOW_ETH_ALEN);
+    snprintf(message.text, sizeof(message.text), "%s", text);
+    return esp_now_send(destination, (const uint8_t *)&message, sizeof(message));
+}
+
+bool espnow_peer_available(void)
+{
+    return peer_known;
+}
+
+BaseType_t espnow_receive(espnow_message_t *message, TickType_t timeout)
+{
+    if (message == NULL || receive_queue == NULL) {
+        return pdFALSE;
+    }
+
+    receive_event_t event;
+    if (xQueueReceive(receive_queue, &event, timeout) != pdPASS) {
+        return pdFALSE;
+    }
+
+    if (event.message.magic != ESPNOW_PROTOCOL_MAGIC ||
+        event.message.version != ESPNOW_PROTOCOL_VERSION ||
+        memcmp(event.source_mac, local_mac, ESP_NOW_ETH_ALEN) == 0 ||
+        memcmp(event.source_mac, event.message.sender_mac, ESP_NOW_ETH_ALEN) != 0) {
+        return pdFALSE;
+    }
+
+    if (!peer_known) {
+        esp_err_t err = add_peer(event.source_mac);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not add discovered peer: %s", esp_err_to_name(err));
+            return pdFALSE;
+        }
+        memcpy(peer_mac, event.source_mac, ESP_NOW_ETH_ALEN);
+        peer_known = true;
+        log_mac("Using unicast peer", peer_mac);
+    }
+
+    const char *type_name = event.message.type == ESPNOW_MESSAGE_DISCOVERY ? "discovery" :
+                            event.message.type == ESPNOW_MESSAGE_COMMAND ? "command" :
+                            event.message.type == ESPNOW_MESSAGE_RESPONSE ? "response" : "unknown";
+    ESP_LOGI(TAG, "RX %s #%" PRIu32 " from %02X:%02X:%02X:%02X:%02X:%02X: %s",
+             type_name, event.message.sequence,
+             event.source_mac[0], event.source_mac[1], event.source_mac[2],
+             event.source_mac[3], event.source_mac[4], event.source_mac[5], event.message.text);
+
+    *message = event.message;
+    return pdPASS;
 }
