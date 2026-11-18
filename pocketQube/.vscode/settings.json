@@ -11,7 +11,7 @@
     "clangd.arguments": [
       "--background-index",
       "--query-driver=**",
-      "--compile-commands-dir=/home/hussein/Code/Vs_Code/CANSAT/catsat-embedded/mobile/build"
+      "--compile-commands-dir=/home/hussein/Code/Vs_Code/CANSAT/catsat-embedded/pocketQube/build"
     ],
     "idf.flashType": "UART"
 }
