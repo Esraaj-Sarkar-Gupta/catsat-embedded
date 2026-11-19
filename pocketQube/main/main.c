@@ -9,7 +9,7 @@
 #include "espnow.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "led_strip.h"
+
 
 #define DISCOVERY_PERIOD_MS 5000
 #define COMMAND_PERIOD_MS 2000
@@ -117,7 +117,7 @@ void app_main(void)
 
             if (err == ESP_OK) {
                 telemetry_sequence++;
-                ESP_LOGI(TAG, "Telemetry packet sent: %" PRIu32,
+                ESP_LOGI(TAG, "Te lemetry packet sent: %" PRIu32,
                         telemetry_sequence);
             } else {
                 ESP_LOGE(TAG, "Telemetry transmission failed: %s",
